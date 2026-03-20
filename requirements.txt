@@ -1,0 +1,13 @@
+# Core
+tqdm==4.66.4
+pyttsx3==2.90
+numpy==1.26.4
+scipy==1.13.0
+requests==2.31.0
+python-dotenv==1.0.1
+tensorflow==2.15.0
+soundfile==0.12.1
+
+# Required for Chinese TTS
+gtts==2.5.1          # Google TTS — needs internet
+miniaudio==1.58      # MP3 decoder — pure Python, no ffmpeg needed
