@@ -1,0 +1,2 @@
+# text-to-speech-edge-impulse-human-command-classifier-chinese-only
+项目用开源的gtts转换文本信息成音频信息然后通过使用miniaudio来把音频文件转换成float格式然后稍微改变一下语音速率以及高低频来生成不同的样本用于训练，之后调用edge impulse api来训练数据并且生成tensorflorlite的模型用于部署。
