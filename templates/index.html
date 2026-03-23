@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TTS → Edge Impulse Pipeline</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: system-ui, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    padding: 24px 16px;
+  }
+
+  .card {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+    padding: 20px;
+    max-width: 760px;
+    margin: 0 auto 16px;
+  }
+
+  h1 { font-size: 1.3rem; font-weight: 700; color: #f1f5f9; margin-bottom: 4px; }
+  h2 { font-size: .9rem; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 14px; }
+
+  /* Mode toggle */
+  .mode-row { display: flex; gap: 20px; align-items: center; }
+  .mode-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: .95rem; }
+  .mode-row input[type=radio] { accent-color: #6366f1; }
+
+  /* Labels section */
+  .labels-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .btn-add {
+    background: #334155; border: none; color: #94a3b8; padding: 5px 12px;
+    border-radius: 6px; cursor: pointer; font-size: .85rem;
+  }
+  .btn-add:hover { background: #475569; color: #e2e8f0; }
+
+  .label-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    background: #0f172a; border: 1px solid #334155; border-radius: 8px;
+    padding: 10px 12px; margin-bottom: 8px;
+  }
+  .label-text {
+    flex: 1; background: transparent; border: none; border-bottom: 1px solid #475569;
+    color: #f1f5f9; font-size: 1rem; outline: none; padding: 2px 4px;
+  }
+  .label-text:focus { border-bottom-color: #6366f1; }
+
+  .btn-record {
+    background: #1d4ed8; border: none; color: #fff; padding: 5px 12px;
+    border-radius: 6px; cursor: pointer; font-size: .85rem; white-space: nowrap;
+  }
+  .btn-record:hover { background: #2563eb; }
+  .btn-record.recording { background: #dc2626; }
+  .btn-record.recording:hover { background: #ef4444; }
+
+  .btn-del { background: none; border: none; color: #64748b; cursor: pointer; font-size: 1.1rem; padding: 2px 4px; }
+  .btn-del:hover { color: #f87171; }
+
+  .takes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; width: 100%; }
+  .take-chip {
+    display: flex; align-items: center; gap: 4px;
+    background: #1e3a5f; border-radius: 20px; padding: 3px 10px;
+    font-size: .78rem; color: #93c5fd;
+  }
+  .take-chip button { background: none; border: none; color: #64748b; cursor: pointer; font-size: .85rem; }
+  .take-chip button:hover { color: #f87171; }
+  .take-chip audio { height: 20px; }
+
+  .rec-status { font-size: .78rem; margin-top: 6px; width: 100%; }
+  .rec-status.ok { color: #4ade80; }
+  .rec-status.need { color: #fbbf24; }
+
+  /* Settings */
+  details summary { cursor: pointer; font-size: .9rem; color: #94a3b8; user-select: none; }
+  details summary:hover { color: #e2e8f0; }
+  .settings-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 14px 20px;
+    margin-top: 14px;
+  }
+  .field label { display: block; font-size: .78rem; color: #64748b; margin-bottom: 4px; }
+  .field input[type=number], .field input[type=text] {
+    width: 100%; background: #0f172a; border: 1px solid #334155;
+    color: #f1f5f9; border-radius: 6px; padding: 6px 10px; font-size: .9rem; outline: none;
+  }
+  .field input:focus { border-color: #6366f1; }
+  .field.full { grid-column: span 2; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: .9rem; }
+  .checkbox-row input { accent-color: #6366f1; }
+
+  /* Run button */
+  #btn-run {
+    width: 100%; padding: 12px; background: #6366f1; border: none; color: #fff;
+    border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer;
+    transition: background .15s;
+  }
+  #btn-run:hover:not(:disabled) { background: #4f46e5; }
+  #btn-run:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+
+  /* Log */
+  #log {
+    background: #0f172a; border: 1px solid #334155; border-radius: 8px;
+    padding: 14px; font-family: monospace; font-size: .8rem; color: #94a3b8;
+    height: 240px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  #log .step  { color: #818cf8; font-weight: 600; }
+  #log .ok    { color: #4ade80; }
+  #log .err   { color: #f87171; }
+  #log .audio { color: #38bdf8; }
+
+  /* Download */
+  #download-section { display: none; text-align: center; margin-top: 12px; }
+  #btn-download {
+    display: inline-block; padding: 10px 28px; background: #16a34a;
+    color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: .95rem;
+  }
+  #btn-download:hover { background: #15803d; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>TTS → Edge Impulse Pipeline</h1>
+  <p style="color:#64748b;font-size:.85rem;margin-top:4px;">Train a keyword-spotting model from text or microphone recordings.</p>
+</div>
+
+<!-- Mode -->
+<div class="card">
+  <h2>Input Mode</h2>
+  <div class="mode-row">
+    <label><input type="radio" name="mode" value="tts" checked onchange="setMode('tts')"> Text (TTS)</label>
+    <label><input type="radio" name="mode" value="record" onchange="setMode('record')"> Record Audio</label>
+  </div>
+</div>
+
+<!-- Labels -->
+<div class="card">
+  <div class="labels-header">
+    <h2 style="margin:0">Labels</h2>
+    <button class="btn-add" onclick="addLabel()">+ Add</button>
+  </div>
+  <div id="labels-container"></div>
+</div>
+
+<!-- Settings -->
+<div class="card">
+  <details>
+    <summary>Settings ▼</summary>
+    <div class="settings-grid">
+      <div class="field">
+        <label>Samples / label</label>
+        <input type="number" id="s-samples" value="20" min="3" max="200">
+      </div>
+      <div class="field">
+        <label>Min duration (s)</label>
+        <input type="number" id="s-duration" value="1.5" min="0.5" max="10" step="0.1">
+      </div>
+      <div class="field">
+        <label>Training cycles</label>
+        <input type="number" id="s-cycles" value="100" min="1" max="2000">
+      </div>
+      <div class="field">
+        <label>Learning rate</label>
+        <input type="number" id="s-lr" value="0.0005" min="0.00001" max="1" step="0.0001">
+      </div>
+      <div class="field">
+        <label>Batch size</label>
+        <input type="number" id="s-batch" value="32" min="8" max="256">
+      </div>
+      <div class="field" style="display:flex;align-items:flex-end">
+        <div class="checkbox-row">
+          <input type="checkbox" id="s-autotune">
+          <label for="s-autotune" style="display:inline;font-size:.9rem;color:#e2e8f0;">Auto-tune DSP</label>
+        </div>
+      </div>
+    </div>
+  </details>
+</div>
+
+<!-- Run -->
+<div class="card">
+  <button id="btn-run" onclick="runPipeline()">▶ Run Pipeline</button>
+  <div id="download-section">
+    <a id="btn-download" href="/download">⬇ Download model.tflite</a>
+  </div>
+</div>
+
+<!-- Log -->
+<div class="card">
+  <h2>Log</h2>
+  <div id="log">Waiting for pipeline to start…</div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let mode = 'tts';
+let labelCount = 0;
+
+// recordings[labelIndex] = [ { blob, url, name }, ... ]
+const recordings = {};
+
+const MIN_RECS = 3;
+
+// ---------------------------------------------------------------------------
+// Mode
+// ---------------------------------------------------------------------------
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.record-controls').forEach(el => {
+    el.style.display = m === 'record' ? '' : 'none';
+  });
+  updateRunBtn();
+}
+
+// ---------------------------------------------------------------------------
+// Labels
+// ---------------------------------------------------------------------------
+function addLabel() {
+  const idx = labelCount++;
+  recordings[idx] = [];
+
+  const div = document.createElement('div');
+  div.className = 'label-row';
+  div.id = `label-row-${idx}`;
+  div.dataset.idx = idx;
+
+  div.innerHTML = `
+    <div style="flex:1">
+      <input class="label-text" type="text" placeholder="输入标签 (e.g. 开始)"
+             oninput="updateRunBtn()">
+      <div class="record-controls" style="display:${mode==='record'?'':'none'}">
+        <div class="takes" id="takes-${idx}"></div>
+        <div class="rec-status need" id="rec-status-${idx}">Need ${MIN_RECS} recordings</div>
+      </div>
+    </div>
+    <button class="btn-record" id="rec-btn-${idx}"
+            style="display:${mode==='record'?'':'none'}"
+            onclick="toggleRecord(${idx})">🎙 Record</button>
+    <button class="btn-del" onclick="removeLabel(${idx})" title="Remove">✕</button>
+  `;
+  document.getElementById('labels-container').appendChild(div);
+  updateRunBtn();
+}
+
+function removeLabel(idx) {
+  const row = document.getElementById(`label-row-${idx}`);
+  if (row) row.remove();
+  // revoke object URLs
+  (recordings[idx] || []).forEach(r => URL.revokeObjectURL(r.url));
+  delete recordings[idx];
+  updateRunBtn();
+}
+
+// ---------------------------------------------------------------------------
+// Recording
+// ---------------------------------------------------------------------------
+let activeRecorder = null;   // { idx, mediaRecorder, chunks, stream }
+
+function toggleRecord(idx) {
+  if (activeRecorder && activeRecorder.idx === idx) {
+    // Stop recording
+    activeRecorder.mediaRecorder.stop();
+  } else {
+    // Stop any in-progress recording on another label first
+    if (activeRecorder) {
+      activeRecorder.mediaRecorder.stop();
+    }
+    startRecord(idx);
+  }
+}
+
+function startRecord(idx) {
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(stream => {
+      const chunks = [];
+      const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+
+      mr.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+      mr.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        activeRecorder = null;
+
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const url = URL.createObjectURL(blob);
+        const takeN = recordings[idx].length;
+        recordings[idx].push({ blob, url, name: `take_${takeN + 1}` });
+
+        addTakeChip(idx, takeN, url);
+        updateRecStatus(idx);
+        updateRunBtn();
+
+        // Reset button
+        const btn = document.getElementById(`rec-btn-${idx}`);
+        if (btn) { btn.textContent = '🎙 Record'; btn.classList.remove('recording'); }
+      };
+
+      mr.start();
+      activeRecorder = { idx, mediaRecorder: mr, chunks, stream };
+
+      const btn = document.getElementById(`rec-btn-${idx}`);
+      if (btn) { btn.textContent = '⏹ Stop'; btn.classList.add('recording'); }
+    })
+    .catch(err => {
+      alert('Microphone access denied: ' + err.message);
+    });
+}
+
+function addTakeChip(idx, takeN, url) {
+  const container = document.getElementById(`takes-${idx}`);
+  if (!container) return;
+
+  const chip = document.createElement('div');
+  chip.className = 'take-chip';
+  chip.id = `chip-${idx}-${takeN}`;
+  chip.innerHTML = `
+    <audio controls src="${url}"></audio>
+    <span>take_${takeN + 1}</span>
+    <button onclick="removeTake(${idx}, ${takeN})" title="Delete">✕</button>
+  `;
+  container.appendChild(chip);
+}
+
+function removeTake(idx, takeN) {
+  const r = recordings[idx][takeN];
+  if (r) URL.revokeObjectURL(r.url);
+  recordings[idx].splice(takeN, 1);
+
+  // Rebuild chips
+  const container = document.getElementById(`takes-${idx}`);
+  if (container) container.innerHTML = '';
+  recordings[idx].forEach((rec, n) => addTakeChip(idx, n, rec.url));
+
+  updateRecStatus(idx);
+  updateRunBtn();
+}
+
+function updateRecStatus(idx) {
+  const el = document.getElementById(`rec-status-${idx}`);
+  if (!el) return;
+  const n = (recordings[idx] || []).length;
+  if (n >= MIN_RECS) {
+    el.textContent = `${n}/${MIN_RECS} recordings ✓`;
+    el.className = 'rec-status ok';
+  } else {
+    el.textContent = `${n}/${MIN_RECS} — need ${MIN_RECS - n} more`;
+    el.className = 'rec-status need';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Run button validation
+// ---------------------------------------------------------------------------
+function getActiveLabels() {
+  const rows = document.querySelectorAll('#labels-container .label-row');
+  const result = [];
+  rows.forEach(row => {
+    const val = row.querySelector('.label-text')?.value.trim();
+    if (val) result.push({ idx: parseInt(row.dataset.idx), label: val });
+  });
+  return result;
+}
+
+function updateRunBtn() {
+  const btn = document.getElementById('btn-run');
+  const active = getActiveLabels();
+  if (active.length === 0) { btn.disabled = true; return; }
+
+  if (mode === 'record') {
+    const allOk = active.every(({ idx }) => (recordings[idx] || []).length >= MIN_RECS);
+    btn.disabled = !allOk;
+  } else {
+    btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline run
+// ---------------------------------------------------------------------------
+function runPipeline() {
+  const active = getActiveLabels();
+  if (active.length === 0) return;
+
+  const btn = document.getElementById('btn-run');
+  btn.disabled = true;
+  document.getElementById('download-section').style.display = 'none';
+
+  const logEl = document.getElementById('log');
+  logEl.innerHTML = '';
+
+  const fd = new FormData();
+  fd.append('mode', mode);
+
+  active.forEach(({ idx, label }, i) => {
+    fd.append(`label_${i}`, label);
+    if (mode === 'record') {
+      (recordings[idx] || []).forEach((rec, j) => {
+        fd.append(`recordings_${i}_${j}`, rec.blob, `rec_${j}.webm`);
+      });
+    }
+  });
+
+  fd.append('samples_per_label', document.getElementById('s-samples').value);
+  fd.append('duration',          document.getElementById('s-duration').value);
+  fd.append('training_cycles',   document.getElementById('s-cycles').value);
+  fd.append('learning_rate',     document.getElementById('s-lr').value);
+  fd.append('batch_size',        document.getElementById('s-batch').value);
+  fd.append('autotune',          document.getElementById('s-autotune').checked ? 'true' : 'false');
+
+  fetch('/run', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        appendLog(`[ERROR] ${data.error}`, 'err');
+        btn.disabled = false;
+        return;
+      }
+      startSSE();
+    })
+    .catch(err => {
+      appendLog(`[ERROR] ${err}`, 'err');
+      btn.disabled = false;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// SSE log stream
+// ---------------------------------------------------------------------------
+function startSSE() {
+  const es = new EventSource('/stream');
+  es.onmessage = e => {
+    if (e.data === '__DONE__') {
+      es.close();
+      // Re-enable run and maybe show download
+      fetch('/download', { method: 'HEAD' })
+        .then(r => {
+          if (r.ok) document.getElementById('download-section').style.display = '';
+        })
+        .catch(() => {});
+      updateRunBtn();
+      return;
+    }
+    appendLog(e.data);
+  };
+  es.onerror = () => {
+    es.close();
+    updateRunBtn();
+  };
+}
+
+function appendLog(msg, cls) {
+  const el = document.getElementById('log');
+  const line = document.createElement('div');
+
+  // Auto-detect class from message prefix
+  if (!cls) {
+    if (msg.startsWith('==='))      cls = 'step';
+    else if (msg.includes('[Audio]')) cls = 'audio';
+    else if (msg.includes('[TTS]'))  cls = 'audio';
+    else if (msg.includes('[ERROR]') || msg.includes('error')) cls = 'err';
+    else if (msg.includes('complete') || msg.includes('✓')) cls = 'ok';
+  }
+
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+addLabel();
+addLabel();
+</script>
+</body>
+</html>
