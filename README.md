@@ -2,12 +2,14 @@
 
 Automatically converts Chinese text labels into a trained TensorFlow Lite keyword-spotting model via Edge Impulse — no manual Studio interaction required after the initial one-time setup.
 
+Two input modes are supported: **Text (TTS)** generates audio automatically using Google TTS, and **Record Audio** lets you record your own voice in the browser.
+
 ## How it works
 
 ```
-User inputs Chinese text labels
+User inputs labels (text or microphone recordings)
         ↓
-TTS generates WAV audio samples (gTTS, zh-CN + zh-TW accents + augmentation)
+Audio prepared: TTS-generated WAV files  OR  browser recordings (augmented to target count)
         ↓
 WAV files uploaded to Edge Impulse (training + testing split)
         ↓
@@ -55,7 +57,45 @@ Get your API key from Edge Impulse Studio → **Dashboard → Keys**.
 
 ## Usage
 
-### Interactive mode
+### Web UI (recommended)
+
+```bash
+python app.py
+```
+
+Open `http://localhost:5000` in your browser.
+
+```
+┌──────────────────────────────────────────────┐
+│  TTS → Edge Impulse Pipeline                 │
+├──────────────────────────────────────────────┤
+│  MODE:  ● Text (TTS)    ○ Record Audio       │
+├──────────────────────────────────────────────┤
+│  LABELS                           [+ Add]    │
+│  ┌────────────────────────────────────────┐  │
+│  │  [开始     ]  [🎙 Record]  [✕]        │  │
+│  │    ▶ take_1  ▶ take_2  ▶ take_3  ✓   │  │
+│  └────────────────────────────────────────┘  │
+├──────────────────────────────────────────────┤
+│  SETTINGS ▼  Samples | Duration | Cycles ... │
+├──────────────────────────────────────────────┤
+│  [▶ Run Pipeline]                            │
+├──────────────────────────────────────────────┤
+│  LOG  ──────────────────────────────────     │
+│  === Step 1/4: Processing audio ...          │
+│  [Audio] '开始' → augmented 3 clips → 20    │
+├──────────────────────────────────────────────┤
+│  [⬇ Download model.tflite]  (when done)     │
+└──────────────────────────────────────────────┘
+```
+
+**TTS mode** — type labels and click Run. Google TTS generates audio automatically.
+
+**Record mode** — click 🎙 Record, speak the word, click ⏹ Stop. Repeat until each label has at least 3 recordings, then click Run. Augmentation fills the rest up to `Samples/label`.
+
+### CLI (alternative)
+
+#### Interactive mode
 
 ```bash
 python main.py
@@ -69,16 +109,22 @@ You will be prompted to enter Chinese labels one per line:
 请输入标签 (留空结束):
 ```
 
-### Non-interactive mode
+#### Non-interactive mode
 
 ```bash
 python main.py --labels "喂食,开灯,关灯" --samples 30
 ```
 
-### Skip flags (useful for resuming a failed run)
+#### CLI flags
 
 | Flag | Description |
 |---|---|
+| `--labels` | Comma-separated labels |
+| `--samples` | Samples per label (overrides `TTS_SAMPLES_PER_LABEL`) |
+| `--training-cycles` | Training cycles (overrides `TRAINING_CYCLES`) |
+| `--learning-rate` | Learning rate (overrides `LEARNING_RATE`) |
+| `--batch-size` | Batch size (overrides `BATCH_SIZE`) |
+| `--autotune` | Run DSP auto-tune before training |
 | `--skip-tts` | Skip TTS generation, use existing WAV files in `dataset/` |
 | `--skip-upload` | Skip upload, trigger training on already-uploaded data |
 | `--skip-training` | Skip training, only download the model |
@@ -159,17 +205,24 @@ All settings can be overridden in `.env`:
 | `SAMPLE_DURATION` | `1.5` | Length of each audio clip in seconds |
 | `DATASET_DIR` | `dataset` | Directory to save generated WAV files |
 | `TTS_VOLUME` | `1.0` | TTS output volume (0.0–1.0) |
+| `TRAINING_CYCLES` | `100` | Number of training cycles |
+| `LEARNING_RATE` | `0.0005` | Optimizer learning rate |
+| `BATCH_SIZE` | `32` | Training batch size |
+| `AUTOTUNE_DSP` | `false` | Run DSP auto-tune before training |
 
 ## Project structure
 
 ```
 tts_to_model_pipeline/
-├── main.py                        # Pipeline entry point
+├── app.py                         # Flask web UI server
+├── main.py                        # CLI pipeline entry point
 ├── test_model.py                  # Offline accuracy evaluation
 ├── requirements.txt
 ├── .env.example
+├── templates/
+│   └── index.html                 # Single-page web UI
 ├── modules/
-│   ├── tts_generator.py           # gTTS audio generation + augmentation
+│   ├── tts_generator.py           # gTTS audio generation + augmentation + recording support
 │   ├── dataset_builder.py         # 80/20 train/test split
 │   ├── edge_impulse_client.py     # Upload + training API calls
 │   └── model_exporter.py          # Build + download TFLite model
@@ -177,21 +230,14 @@ tts_to_model_pipeline/
 └── exported_model/                # Output model files (git-ignored)
 ```
 
-## Growing model design
-
-Each pipeline run **adds** new data to the existing Edge Impulse project rather than replacing it. This means:
-
-- Previously trained labels are retained
-- The model is retrained on the full accumulated dataset each run
-- New labels can be added incrementally over time
-
 ## Improving accuracy
 
 | Action | Expected impact |
 |---|---|
 | Increase `TTS_SAMPLES_PER_LABEL` to 50+ | Medium — more augmentation variety |
-| Increase `trainingCycles` in `edge_impulse_client.py` (default 100) | Medium |
-| Use real human voice recordings instead of TTS | High |
+| Increase `TRAINING_CYCLES` (default 100) | Medium |
+| Use Record mode with real voice recordings | High |
+| Record 5–10 takes per label instead of 3 | Medium-High |
 
 ## API reference
 
@@ -212,7 +258,7 @@ Each pipeline run **adds** new data to the existing Edge Impulse project rather 
 | Upload WAV file | `POST /api/{training\|testing}/files` | Once per WAV file |
 
 - **Free tier: ~3 hours of audio storage per project**
-- Each run appends data (growing model) — monitor storage usage over time
+- Each run clears and re-uploads data — storage usage stays bounded
 
 ---
 

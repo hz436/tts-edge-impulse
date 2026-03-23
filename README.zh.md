@@ -2,12 +2,14 @@
 
 自动将中文文本标签转换为训练好的 TensorFlow Lite 关键词识别模型，整个过程通过 Edge Impulse API 完成，无需手动操作 Studio 界面（首次配置除外）。
 
+支持两种输入模式：**文本（TTS）** 模式通过 Google TTS 自动生成音频；**录音** 模式可在浏览器中直接使用麦克风录制真实人声。
+
 ## 工作原理
 
 ```
-用户输入中文文本标签
+用户输入标签（文本或麦克风录音）
         ↓
-TTS 生成 WAV 音频样本（gTTS，普通话 + 台湾口音 + 数据增强）
+音频准备：TTS 自动生成 WAV 文件  或  浏览器录音（增强至目标数量）
         ↓
 WAV 文件上传至 Edge Impulse（训练集 + 测试集自动划分）
         ↓
@@ -55,7 +57,45 @@ API Key 可在 Edge Impulse Studio → **Dashboard → Keys** 中获取。
 
 ## 使用方法
 
-### 交互模式
+### Web UI（推荐）
+
+```bash
+python app.py
+```
+
+在浏览器中打开 `http://localhost:5000`。
+
+```
+┌──────────────────────────────────────────────┐
+│  TTS → Edge Impulse Pipeline                 │
+├──────────────────────────────────────────────┤
+│  模式：  ● 文本（TTS）    ○ 录音             │
+├──────────────────────────────────────────────┤
+│  标签                             [+ 添加]   │
+│  ┌────────────────────────────────────────┐  │
+│  │  [开始     ]  [🎙 录音]  [✕]          │  │
+│  │    ▶ 第1次  ▶ 第2次  ▶ 第3次  ✓      │  │
+│  └────────────────────────────────────────┘  │
+├──────────────────────────────────────────────┤
+│  设置 ▼  样本数 | 时长 | 训练轮次 ...        │
+├──────────────────────────────────────────────┤
+│  [▶ 运行流水线]                              │
+├──────────────────────────────────────────────┤
+│  日志  ────────────────────────────────      │
+│  === 第 1/4 步：处理音频 ...                 │
+│  [Audio] '开始' → 增强 3 条录音 → 20 个文件 │
+├──────────────────────────────────────────────┤
+│  [⬇ 下载 model.tflite]  （完成后显示）      │
+└──────────────────────────────────────────────┘
+```
+
+**TTS 模式** — 输入标签，点击运行。Google TTS 自动合成音频。
+
+**录音模式** — 点击 🎙 录音，说出词语，点击 ⏹ 停止。每个标签至少录制 3 次后即可点击运行。系统会通过数据增强将录音数量自动填充至 `样本数/标签` 设定值。
+
+### 命令行（备用方式）
+
+#### 交互模式
 
 ```bash
 python main.py
@@ -69,17 +109,23 @@ python main.py
 请输入标签 (留空结束):
 ```
 
-### 非交互模式
+#### 非交互模式
 
 ```bash
 python main.py --labels "喂食,开灯,关灯" --samples 30
 ```
 
-### 跳过标志（用于恢复中断的任务）
+#### 命令行参数
 
 | 参数 | 说明 |
 |---|---|
-| `--skip-tts` | 跳过 TTS 生成，直接使用 `dataset/` 中已有的 WAV 文件 |
+| `--labels` | 逗号分隔的标签列表 |
+| `--samples` | 每个标签的样本数（覆盖 `TTS_SAMPLES_PER_LABEL`） |
+| `--training-cycles` | 训练轮次（覆盖 `TRAINING_CYCLES`） |
+| `--learning-rate` | 学习率（覆盖 `LEARNING_RATE`） |
+| `--batch-size` | 批次大小（覆盖 `BATCH_SIZE`） |
+| `--autotune` | 训练前运行 DSP 自动调优 |
+| `--skip-tts` | 跳过 TTS 生成，使用 `dataset/` 中已有的 WAV 文件 |
 | `--skip-upload` | 跳过上传，对已上传的数据直接触发训练 |
 | `--skip-training` | 跳过训练，仅下载模型 |
 | `--export-only` | 仅下载已训练好的模型 |
@@ -159,17 +205,24 @@ python test_model.py --model exported_model/model.tflite --labels exported_model
 | `SAMPLE_DURATION` | `1.5` | 每段音频时长（秒） |
 | `DATASET_DIR` | `dataset` | 生成的 WAV 文件保存目录 |
 | `TTS_VOLUME` | `1.0` | TTS 输出音量（0.0–1.0） |
+| `TRAINING_CYCLES` | `100` | 训练轮次 |
+| `LEARNING_RATE` | `0.0005` | 优化器学习率 |
+| `BATCH_SIZE` | `32` | 训练批次大小 |
+| `AUTOTUNE_DSP` | `false` | 训练前是否运行 DSP 自动调优 |
 
 ## 项目结构
 
 ```
 tts_to_model_pipeline/
-├── main.py                        # 流水线入口
+├── app.py                         # Flask Web UI 服务器
+├── main.py                        # 命令行流水线入口
 ├── test_model.py                  # 离线准确率评估脚本
 ├── requirements.txt
 ├── .env.example
+├── templates/
+│   └── index.html                 # 单页 Web UI
 ├── modules/
-│   ├── tts_generator.py           # gTTS 音频生成与数据增强
+│   ├── tts_generator.py           # gTTS 音频生成、数据增强、录音支持
 │   ├── dataset_builder.py         # 80/20 训练集/测试集划分
 │   ├── edge_impulse_client.py     # 上传与训练 API 调用
 │   └── model_exporter.py          # 构建与下载 TFLite 模型
@@ -177,21 +230,14 @@ tts_to_model_pipeline/
 └── exported_model/                # 输出模型文件（已加入 .gitignore）
 ```
 
-## 累积式模型设计
-
-每次运行流水线时，新数据会**追加**到现有 Edge Impulse 项目中，而不是覆盖。这意味着：
-
-- 之前训练的标签数据会保留
-- 每次重新训练都使用全量历史数据
-- 可以随时增量添加新标签
-
 ## 提升准确率
 
 | 方法 | 预期效果 |
 |---|---|
 | 将 `TTS_SAMPLES_PER_LABEL` 增加至 50 及以上 | 中等 — 增加增强变体的多样性 |
-| 提高 `edge_impulse_client.py` 中的 `trainingCycles`（默认 100） | 中等 |
-| 使用真实人声录音替代 TTS | 显著提升 |
+| 提高 `TRAINING_CYCLES`（默认 100） | 中等 |
+| 使用录音模式录制真实人声 | 显著提升 |
+| 每个标签录制 5–10 次（而非最少 3 次） | 中等偏高 |
 
 ## API 调用说明
 
@@ -212,7 +258,7 @@ tts_to_model_pipeline/
 | 上传 WAV 文件 | `POST /api/{training\|testing}/files` | 每个 WAV 文件上传时调用一次 |
 
 - **免费版限制：每个项目约 3 小时音频存储空间**
-- 每次运行会追加数据（累积式模型）—— 需注意存储用量
+- 每次运行会先清除旧数据再重新上传，存储用量不会持续增长
 
 ---
 
