@@ -221,8 +221,11 @@ def main() -> None:
         client.upload_dataset(split)
 
     if not args.skip_training and not args.export_only:
+        print("\n=== Step 3c/4: Generating DSP features ===")
+        client.generate_features()
+
         if cfg["autotune"]:
-            print("\n=== Step 3c/4: Running DSP auto-tune ===")
+            print("\n=== Step 3c2/4: Running DSP auto-tune ===")
             client.run_dsp_autotune()
 
         print("\n=== Step 3d/4: Starting training job ===")

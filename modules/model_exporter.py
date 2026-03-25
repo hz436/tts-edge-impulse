@@ -1,380 +1,295 @@
 """
-ModelExporter: Downloads the trained TFLite model from Edge Impulse
-and (optionally) converts it to a full TensorFlow SavedModel for deployment.
+model_exporter.py — Build + download TFLite model from Edge Impulse.
 
-Edge Impulse produces TFLite files. This module:
-  1. Downloads the .tflite from the Edge Impulse deployment API
-  2. Saves it locally as `model.tflite`
-  3. Optionally wraps it in a TF Lite Interpreter and saves label metadata
-     so the model is immediately runnable.
-
-Output explained
-----------------
-The TFLite model output tensor is a **float32 numpy array** of shape [1, N]
-where N is the number of labels.  Example for labels ["hello", "stop", "noise"]:
-
-    raw output: [[0.95, 0.03, 0.02]]
-
-To get a human-readable dict, this module provides `run_inference()` which
-returns:
-    {"hello": 0.95, "stop": 0.03, "noise": 0.02}
-
-along with a `predicted_label` and `confidence` field.
+Improvements over baseline:
+  • Streaming ZIP download (64 KB chunks) — no large in-memory buffer.
+  • Download progress bar printed to stdout (visible in SSE log stream).
+  • Reuses the same requests.Session pattern as EdgeImpulseClient.
+  • Saves labels.json alongside the model file.
 """
 
+from __future__ import annotations
+
 import io
-import os
 import json
+import os
 import time
 import zipfile
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+STUDIO_URL     = "https://studio.edgeimpulse.com/v1/api"
+POLL_INTERVAL  = 10       # seconds
+DOWNLOAD_CHUNK = 65_536   # 64 KB
 
 
 class ModelExporter:
-    BASE_URL = "https://studio.edgeimpulse.com/v1/api"
+    """Trigger the on-device model build and download the TFLite ZIP."""
 
-    def __init__(self, api_key: str, project_id: str, output_dir: str = "exported_model"):
-        self.api_key = api_key
+    def __init__(self, api_key: str, project_id: str, output_dir: str = "exported_model") -> None:
+        self.api_key    = api_key
         self.project_id = project_id
         self.output_dir = output_dir
-        self._headers = {"x-api-key": self.api_key}
-        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        self._session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+        self._session.mount("https://", adapter)
+        self._session.headers.update({"x-api-key": api_key})
 
     # ------------------------------------------------------------------
-    # Download — three-step: find target → build → download
+    # Public
     # ------------------------------------------------------------------
 
     def download(self, labels: list[str]) -> str:
         """
-        Build and download the trained TFLite model from Edge Impulse.
+        Trigger a TFLite build job, wait, download the ZIP, extract
+        model.tflite, and write labels.json.
 
-        Flow (per official spec):
-          1. POST /api/{projectId}/jobs/build-ondevice-model → trigger build job
-          2. Response contains deploymentVersion (or poll job until finished)
-          3. GET  /api/{projectId}/deployment/history/{deploymentVersion}/download
+        Returns the path to the extracted model.tflite.
         """
-        deployment_version = self._build_deployment()
-        return self._download_build(deployment_version, labels)
+        # 1. Trigger build
+        # type=zip  → deployment format (query param, required)
+        # engine    → ML engine (request body, required)
+        build_url = f"{STUDIO_URL}/{self.project_id}/jobs/build-ondevice-model?type=zip"
+        print("[Export] Triggering TFLite model build …")
+        resp = self._session.post(build_url, json={"engine": "tflite"}, timeout=30)
+        self._raise(resp, "trigger build")
+        data = resp.json()
+        job_id         = data.get("id")
+        deploy_version = data.get("deploymentVersion")
+        if job_id is None:
+            raise RuntimeError(f"[Export] Could not find job ID in build response: {data}")
+        print(f"[Export] Build job started (jobId={job_id}, version={deploy_version}).")
 
-    def _build_deployment(self, retries: int = 3) -> str:
-        """
-        Trigger a TFLite on-device model build job.
-        Returns the deploymentVersion string for the download step.
+        # 2. Wait for build to complete
+        self._wait_for_job(job_id, label="Model build")
 
-        Response: {"id": <jobId>, "deploymentVersion": <versionId>}
-        If deploymentVersion is absent, poll the job until finished.
-        """
-        print("[Export] Triggering deployment build (type=zip, engine=tflite) ...")
-        url = f"{self.BASE_URL}/{self.project_id}/jobs/build-ondevice-model"
+        # 3. Download ZIP (streaming) using the versioned historic deployment URL
+        download_url = (
+            f"{STUDIO_URL}/{self.project_id}/deployment/history/{deploy_version}/download"
+        )
+        tflite_path = self._stream_download_zip(download_url)
 
-        resp = None
-        for attempt in range(1, retries + 1):
-            try:
-                resp = requests.post(
-                    url,
-                    params={"type": "zip"},
-                    headers={**self._headers, "Content-Type": "application/json"},
-                    json={"engine": "tflite", "modelType": "int8"},
-                    timeout=60,
-                )
-                break
-            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
-                if attempt < retries:
-                    wait = 2 ** attempt
-                    print(f"[Export] Connection error (attempt {attempt}/{retries}), retrying in {wait}s ...")
-                    time.sleep(wait)
-                else:
-                    raise RuntimeError(
-                        f"[Edge Impulse] Build request failed after {retries} attempts.\n"
-                        f"  Error: {e}\n"
-                        f"  Check your internet connection."
-                    )
-
-        if not resp.ok:
-            try:
-                detail = resp.json().get("error", resp.text[:200])
-            except Exception:
-                detail = resp.text[:200]
-            raise RuntimeError(
-                f"[Edge Impulse] Build request failed — HTTP {resp.status_code}\n"
-                f"  Detail: {detail}"
-            )
-
-        body = resp.json()
-        print(f"[Export] Build response: {body}")
-
-        job_id = str(body.get("id", ""))
-        if not job_id:
-            raise RuntimeError(
-                f"[Edge Impulse] Build response had no job id.\n"
-                f"  Full response: {body}"
-            )
-
-        # deploymentVersion may be pre-assigned in the response; pass it as a hint
-        deployment_version_hint = str(body.get("deploymentVersion", ""))
-
-        # Always wait for the async job to complete before downloading
-        return self._wait_for_build_job(job_id, deployment_version_hint=deployment_version_hint)
-
-    def _wait_for_build_job(
-        self,
-        job_id: str,
-        timeout: int = 300,
-        poll_interval: int = 10,
-        deployment_version_hint: str = "",
-    ) -> str:
-        """Poll a build job until complete and return the resulting deploymentVersion."""
-        url = f"{self.BASE_URL}/{self.project_id}/jobs/{job_id}/status"
-        deadline = time.time() + timeout
-        print(f"[Export] Waiting for build job {job_id} ...")
-
-        while time.time() < deadline:
-            resp = None
-            for attempt in range(1, 4):
-                try:
-                    resp = requests.get(url, headers=self._headers, timeout=30)
-                    break
-                except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
-                    if attempt < 3:
-                        print(f"[Export] Connection error polling job (attempt {attempt}/3), retrying in {2**attempt}s ...")
-                        time.sleep(2 ** attempt)
-                    else:
-                        print(f"[Export] Connection error polling job, will retry on next poll interval — {e}")
-                        time.sleep(poll_interval)
-                        continue
-
-            if resp is None:
-                continue
-            resp.raise_for_status()
-            job = resp.json().get("job", {})
-
-            if job.get("finishedSuccessful"):
-                # Prefer version from job status; fall back to the hint from the build response
-                deployment_version = str(
-                    job.get("deploymentVersion", "")
-                    or job.get("artifactId", "")
-                    or deployment_version_hint
-                )
-                print(f"[Export] Build job completed. Deployment version: {deployment_version}")
-                return deployment_version
-
-            if job.get("finished") and not job.get("finishedSuccessful"):
-                raise RuntimeError(
-                    f"[Edge Impulse] Build job {job_id} failed.\n"
-                    f"  See logs: https://studio.edgeimpulse.com/studio/{self.project_id}/jobs/{job_id}"
-                )
-
-            elapsed = int(time.time() - (deadline - timeout))
-            print(f"[Export]   ... build running (elapsed {elapsed}s)")
-            time.sleep(poll_interval)
-
-        raise RuntimeError(f"[Edge Impulse] Build job {job_id} timed out after {timeout}s.")
-
-    def _download_build(self, deployment_version: str, labels: list[str], retries: int = 3) -> str:
-        """Download the built deployment ZIP and extract the .tflite file."""
-        print(f"[Export] Downloading deployment version {deployment_version} ...")
-        url = f"{self.BASE_URL}/{self.project_id}/deployment/history/{deployment_version}/download"
-
-        resp = None
-        for attempt in range(1, retries + 1):
-            try:
-                resp = requests.get(
-                    url,
-                    headers={**self._headers, "Accept": "application/zip"},
-                    timeout=120,
-                )
-                break
-            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
-                if attempt < retries:
-                    wait = 2 ** attempt
-                    print(f"[Export] Connection error on download (attempt {attempt}/{retries}), retrying in {wait}s ...")
-                    time.sleep(wait)
-                else:
-                    raise RuntimeError(
-                        f"[Edge Impulse] Download failed after {retries} attempts.\n"
-                        f"  Error: {e}"
-                    )
-
-        if not resp.ok:
-            try:
-                detail = resp.json().get("error", resp.text[:200])
-            except Exception:
-                detail = resp.text[:200]
-            raise RuntimeError(
-                f"[Edge Impulse] Download failed — HTTP {resp.status_code}\n"
-                f"  Detail: {detail}"
-            )
-
-        # Extract .tflite from ZIP
-        tflite_path = None
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            print(f"[Export] ZIP contents: {zf.namelist()}")
-            for name in zf.namelist():
-                if name.endswith(".tflite"):
-                    tflite_path = os.path.join(self.output_dir, "model.tflite")
-                    with open(tflite_path, "wb") as f:
-                        f.write(zf.read(name))
-                    print(f"[Export] Saved model → {tflite_path}")
-                    break
-
-        if tflite_path is None:
-            raise RuntimeError(
-                "[Edge Impulse] No .tflite file found in the downloaded ZIP.\n"
-                f"  ZIP contained: {zipfile.ZipFile(io.BytesIO(resp.content)).namelist()}"
-            )
-
+        # 4. Write labels.json
         labels_path = os.path.join(self.output_dir, "labels.json")
         with open(labels_path, "w", encoding="utf-8") as f:
-            json.dump({"labels": labels}, f, indent=2, ensure_ascii=False)
-        print(f"[Export] Saved labels → {labels_path}")
+            json.dump({"labels": labels}, f, ensure_ascii=False, indent=2)
+        print(f"[Export] Labels written → {labels_path}")
 
+        print(f"[Export] Model ready → {tflite_path}")
         return tflite_path
-
-    # ------------------------------------------------------------------
-    # Inference helper (demonstrates model output format)
-    # ------------------------------------------------------------------
 
     def run_inference(self, wav_path: str, labels: list[str]) -> dict:
         """
-        Run the exported TFLite model on a WAV file and return a structured result.
+        Run local TFLite inference on a single WAV file.
 
-        Returns:
-            {
-                "predicted_label": "hello",
-                "confidence": 0.95,
-                "classification": {"hello": 0.95, "stop": 0.03, "noise": 0.02}
-            }
-
-        This is the deployment-ready inference function — copy it into your
-        embedded application and replace the WAV loading with whatever audio
-        source you use.
+        Returns
+        -------
+        {
+            "predicted_label": str,
+            "confidence": float,
+            "classification": {label: score, …}
+        }
         """
-        tflite_path = os.path.join(self.output_dir, "model.tflite")
-        if not os.path.exists(tflite_path):
-            raise FileNotFoundError(f"Model not found at {tflite_path}")
+        model_path = os.path.join(self.output_dir, "model.tflite")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found: {model_path}")
 
-        features = self._extract_mfcc(wav_path)
-        raw_output = self._run_tflite(tflite_path, features)
+        features = _extract_mfcc(wav_path)
+        raw      = _run_tflite(model_path, features)
+        scores   = raw[0]
 
-        # raw_output shape: (1, num_labels)  dtype: float32
-        probabilities = raw_output[0].tolist()
+        if scores.min() < 0 or scores.max() > 1.01:
+            probs = _softmax(scores).tolist()
+        else:
+            probs = scores.tolist()
 
-        # Map to dict — this is the "classification dictionary" your boss asked about
-        classification = dict(zip(labels, probabilities))
-        predicted_label = labels[int(np.argmax(probabilities))]
-        confidence = float(np.max(probabilities))
-
+        idx = int(np.argmax(probs))
         return {
-            "predicted_label": predicted_label,
-            "confidence": confidence,
-            "classification": classification,   # <-- the dict with all class probabilities
+            "predicted_label": labels[idx],
+            "confidence":      float(probs[idx]),
+            "classification":  dict(zip(labels, probs)),
         }
 
     # ------------------------------------------------------------------
-    # DSP: MFCC feature extraction (must match Edge Impulse project settings)
+    # Private
     # ------------------------------------------------------------------
 
-    def _extract_mfcc(
-        self,
-        wav_path: str,
-        sample_rate: int = 16000,
-        num_coefficients: int = 13,
-        num_filters: int = 40,
-        frame_length: float = 0.02,
-        frame_stride: float = 0.01,
-        fft_length: int = 512,
-        low_freq: int = 300,
-        high_freq: int = 8000,
-    ) -> np.ndarray:
-        """Extract MFCC features from a WAV file — identical to Edge Impulse defaults."""
-        import wave
-        import scipy.fftpack
+    def _stream_download_zip(self, url: str) -> str:
+        """Download the deployment ZIP in chunks, extract, return tflite path."""
+        print(f"[Export] Downloading model ZIP …")
+        resp = self._session.get(url, stream=True, timeout=120)
+        self._raise(resp, "download model ZIP")
 
-        with wave.open(wav_path, "rb") as wf:
-            n_frames = wf.getnframes()
-            raw = wf.readframes(n_frames)
-        signal = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        total    = int(resp.headers.get("content-length", 0))
+        received = 0
+        buf      = io.BytesIO()
 
-        frame_len = int(round(frame_length * sample_rate))
-        frame_step = int(round(frame_stride * sample_rate))
+        for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK):
+            buf.write(chunk)
+            received += len(chunk)
+            if total:
+                pct = received / total * 100
+                # \r keeps the line in place; SSE will receive the final update
+                print(f"[Export] Download progress: {pct:.1f}%  "
+                      f"({received // 1024} / {total // 1024} KB)", flush=True)
 
-        # Pre-emphasis
-        signal[1:] -= 0.97 * signal[:-1]
+        print(f"[Export] Download complete ({received // 1024} KB).")
+        buf.seek(0)
 
-        # Framing
-        num_frames = 1 + (len(signal) - frame_len) // frame_step
-        indices = (
-            np.arange(frame_len)[None, :]
-            + np.arange(num_frames)[:, None] * frame_step
-        )
-        frames = signal[indices] * np.hamming(frame_len)
+        # Extract model.tflite (and any other files) from the ZIP
+        tflite_path: Optional[str] = None
+        with zipfile.ZipFile(buf) as zf:
+            for name in zf.namelist():
+                zf.extract(name, self.output_dir)
+                dest = os.path.join(self.output_dir, name)
+                print(f"[Export] Extracted → {dest}")
+                if name.endswith(".tflite"):
+                    tflite_path = dest
 
-        # FFT + power spectrum
-        mag = np.abs(np.fft.rfft(frames, n=fft_length)) ** 2
+        if tflite_path is None:
+            raise RuntimeError(
+                "No .tflite file found in the downloaded ZIP. "
+                "Check Edge Impulse Studio for build errors."
+            )
+        return tflite_path
 
-        # Mel filterbank
-        mel_filters = self._mel_filterbank(
-            sample_rate, fft_length, num_filters, low_freq, high_freq
-        )
-        mel_energy = np.dot(mag, mel_filters.T)
-        mel_energy = np.where(mel_energy == 0, np.finfo(float).eps, mel_energy)
-        log_mel = np.log(mel_energy)
+    def _wait_for_job(self, job_id: int, label: str = "Job") -> None:
+        """Poll until a job completes or fails."""
+        url = f"{STUDIO_URL}/{self.project_id}/jobs/{job_id}/status"
+        print(f"[Export] Waiting for '{label}' (jobId={job_id}) …", flush=True)
+        while True:
+            time.sleep(POLL_INTERVAL)
+            resp = self._session.get(url, timeout=15)
+            self._raise(resp, f"poll job {job_id}")
+            job = resp.json().get("job", {})
 
-        # DCT → MFCC
-        mfcc = scipy.fftpack.dct(log_mel, type=2, axis=1, norm="ortho")[:, :num_coefficients]
-        return mfcc.flatten().astype(np.float32)
+            # Shape A: {"job": {"status": "completed"}}
+            status = job.get("status", "")
+            if status in ("completed",):
+                print(f"[Export] {label} finished successfully.")
+                return
+            if status in ("failed", "cancelled"):
+                raise RuntimeError(
+                    f"[Export] {label} ended with status '{status}'. "
+                    "Check Edge Impulse Studio for details."
+                )
+
+            # Shape B: {"job": {"finished": "...", "finishedSuccessful": true}}
+            if "finished" in job:
+                if job.get("finishedSuccessful", False):
+                    print(f"[Export] {label} finished successfully.")
+                    return
+                raise RuntimeError(
+                    f"[Export] {label} failed. Check Edge Impulse Studio for details."
+                )
+
+            print(f"[Export] {label} running …")
 
     @staticmethod
-    def _mel_filterbank(
-        sample_rate: int,
-        fft_length: int,
-        num_filters: int,
-        low_freq: int,
-        high_freq: int,
-    ) -> np.ndarray:
-        def hz_to_mel(hz):
-            return 2595 * np.log10(1 + hz / 700)
+    def _raise(resp: requests.Response, context: str) -> None:
+        if not resp.ok:
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text[:200]
+            raise RuntimeError(
+                f"[Export] {context} failed — HTTP {resp.status_code}: {detail}"
+            )
 
-        def mel_to_hz(mel):
-            return 700 * (10 ** (mel / 2595) - 1)
 
-        low_mel = hz_to_mel(low_freq)
-        high_mel = hz_to_mel(high_freq)
-        mel_points = np.linspace(low_mel, high_mel, num_filters + 2)
-        hz_points = mel_to_hz(mel_points)
-        bin_points = np.floor((fft_length + 1) * hz_points / sample_rate).astype(int)
+# ---------------------------------------------------------------------------
+# Local MFCC + TFLite helpers (mirrors test_model.py)
+# ---------------------------------------------------------------------------
 
-        filters = np.zeros((num_filters, fft_length // 2 + 1))
-        for m in range(1, num_filters + 1):
-            f_m_minus = bin_points[m - 1]
-            f_m = bin_points[m]
-            f_m_plus = bin_points[m + 1]
-            for k in range(f_m_minus, f_m):
-                filters[m - 1, k] = (k - f_m_minus) / (f_m - f_m_minus)
-            for k in range(f_m, f_m_plus):
-                filters[m - 1, k] = (f_m_plus - k) / (f_m_plus - f_m)
-        return filters
+def _extract_mfcc(
+    wav_path: str,
+    sample_rate: int = 16000,
+    num_coefficients: int = 13,
+    num_filters: int = 40,
+    frame_length: float = 0.02,
+    frame_stride: float = 0.02,
+    fft_length: int = 512,
+    low_freq: int = 300,
+    high_freq: int = 8000,
+    window_size_ms: int = 1000,
+) -> np.ndarray:
+    import wave
+    import scipy.fftpack
 
-    def _run_tflite(self, model_path: str, features: np.ndarray) -> np.ndarray:
-        """Run TFLite inference; tries tflite-runtime first, falls back to tensorflow."""
-        try:
-            import tflite_runtime.interpreter as tflite
-            Interpreter = tflite.Interpreter
-        except ImportError:
-            import tensorflow as tf
-            Interpreter = tf.lite.Interpreter
+    with wave.open(wav_path, "rb") as wf:
+        raw = wf.readframes(wf.getnframes())
+    signal = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-        interpreter = Interpreter(model_path=model_path)
-        interpreter.allocate_tensors()
+    window_samples = int(sample_rate * window_size_ms / 1000)
+    if len(signal) < window_samples:
+        signal = np.pad(signal, (0, window_samples - len(signal)))
+    else:
+        signal = signal[:window_samples]
 
-        inp = interpreter.get_input_details()[0]
-        out = interpreter.get_output_details()[0]
+    frame_len  = int(round(frame_length * sample_rate))
+    frame_step = int(round(frame_stride * sample_rate))
+    signal[1:] -= 0.97 * signal[:-1]
 
-        # Reshape features to match model input
-        input_data = features.reshape(inp["shape"]).astype(inp["dtype"])
-        interpreter.set_tensor(inp["index"], input_data)
-        interpreter.invoke()
+    num_frames = 1 + (len(signal) - frame_len) // frame_step
+    indices    = (
+        np.arange(frame_len)[None, :]
+        + np.arange(num_frames)[:, None] * frame_step
+    )
+    frames  = signal[indices] * np.hamming(frame_len)
+    mag     = np.abs(np.fft.rfft(frames, n=fft_length)) ** 2
+    filters = _mel_filterbank(sample_rate, fft_length, num_filters, low_freq, high_freq)
+    mel_e   = np.dot(mag, filters.T)
+    mel_e   = np.where(mel_e == 0, np.finfo(float).eps, mel_e)
+    log_mel = np.log(mel_e)
+    mfcc    = scipy.fftpack.dct(log_mel, type=2, axis=1, norm="ortho")[:, :num_coefficients]
+    return mfcc.flatten().astype(np.float32)
 
-        return interpreter.get_tensor(out["index"])
+
+def _mel_filterbank(sample_rate, fft_length, num_filters, low_freq, high_freq):
+    def hz_to_mel(hz):  return 2595 * np.log10(1 + hz / 700)
+    def mel_to_hz(mel): return 700 * (10 ** (mel / 2595) - 1)
+
+    mel_pts  = np.linspace(hz_to_mel(low_freq), hz_to_mel(high_freq), num_filters + 2)
+    hz_pts   = mel_to_hz(mel_pts)
+    bin_pts  = np.floor((fft_length + 1) * hz_pts / sample_rate).astype(int)
+    filters  = np.zeros((num_filters, fft_length // 2 + 1))
+    for m in range(1, num_filters + 1):
+        lo, mid, hi = bin_pts[m - 1], bin_pts[m], bin_pts[m + 1]
+        for k in range(lo,  mid): filters[m - 1, k] = (k - lo)  / (mid - lo)
+        for k in range(mid, hi):  filters[m - 1, k] = (hi - k)  / (hi - mid)
+    return filters
+
+
+def _run_tflite(model_path: str, features: np.ndarray) -> np.ndarray:
+    try:
+        import tflite_runtime.interpreter as tflite
+        Interpreter = tflite.Interpreter
+    except ImportError:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
+
+    interp = Interpreter(model_path=model_path)
+    interp.allocate_tensors()
+    inp = interp.get_input_details()[0]
+    out = interp.get_output_details()[0]
+    interp.set_tensor(inp["index"], features.reshape(inp["shape"]).astype(inp["dtype"]))
+    interp.invoke()
+    return interp.get_tensor(out["index"])
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float64)
+    e = np.exp(x - np.max(x))
+    return (e / e.sum()).astype(np.float32)

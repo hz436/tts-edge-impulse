@@ -139,8 +139,11 @@ def _run_pipeline(
         print("=== Step 3b/4: Uploading dataset to Edge Impulse ===")
         client.upload_dataset(split)
 
+        print("=== Step 3c/4: Generating DSP features ===")
+        client.generate_features()
+
         if autotune:
-            print("=== Step 3c/4: Running DSP auto-tune ===")
+            print("=== Step 3c2/4: Running DSP auto-tune ===")
             client.run_dsp_autotune()
 
         print("=== Step 3d/4: Starting training job ===")
